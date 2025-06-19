@@ -1,6 +1,7 @@
 // gpuSetup.js
 import { simShader } from './simShader.js';
 import { getRenderShaderCode } from './renderShader.js';
+import * as WASM from './wasmLoader.js';
 
 // --- Variables globales de WebGPU y simulación ---
 export let PARTICLE_COUNT = 4000;
@@ -38,6 +39,10 @@ let simPipeline;
 let simBindGroup;
 let renderPipeline;
 let renderBindGroup;
+
+// WASM simulation state
+let useWasmSimulation = false;
+let wasmSimulation = null;
 
 // Almacena los valores brutos y aleatorios que luego se transformarán
 export let rawForceTableValues = new Float32Array(numParticleTypes * numParticleTypes);
@@ -120,6 +125,17 @@ export async function setupWebGPU(canvasId) {
     canvasWidth = canvas.width = window.innerWidth;
     canvasHeight = canvas.height = window.innerHeight;
 
+    // Try to initialize WASM simulation
+    useWasmSimulation = await WASM.initWasm();
+    if (useWasmSimulation) {
+        console.log('Using WASM-accelerated simulation');
+        wasmSimulation = WASM.createSimulation(PARTICLE_COUNT, numParticleTypes, canvasWidth, canvasHeight);
+        WASM.updateForceTable(rawForceTableValues);
+        WASM.updateRadioByType(radioByType);
+    } else {
+        console.log('Fallback to WebGPU compute shader simulation');
+    }
+
     // Buffers iniciales
     particleBuffer = device.createBuffer({
         size: particles.byteLength,
@@ -166,6 +182,12 @@ export function updateForceTable(initialGeneration = false) {
         currentForceTable[i] = constrain(transformedValue, -1.0, 1.0);
     }
     device.queue.writeBuffer(forceTableBuffer, 0, currentForceTable);
+    
+    // Update WASM simulation force table
+    if (useWasmSimulation && wasmSimulation) {
+        WASM.updateForceTable(currentForceTable);
+    }
+    
     return currentForceTable;
 }
 
@@ -190,6 +212,11 @@ export function initializeParticles() {
     }
     console.log("Distribución de ptype:", typeCounts);
     device.queue.writeBuffer(particleBuffer, 0, particles);
+    
+    // Also reset WASM simulation if available
+    if (useWasmSimulation && wasmSimulation) {
+        WASM.resetParticles();
+    }
 }
 
 export function initializeRadioByType() {
@@ -198,6 +225,11 @@ export function initializeRadioByType() {
         radioByType[i] = Math.random() * 2 - 1; // [-50, 50]
     }
     device.queue.writeBuffer(radioByTypeBuffer, 0, radioByType);
+    
+    // Update WASM simulation radio by type
+    if (useWasmSimulation && wasmSimulation) {
+        WASM.updateRadioByType(radioByType);
+    }
 }
 
 export function updateSimParamsBuffer() {
@@ -269,11 +301,41 @@ export function createPipelines() {
 // --- Bucle de renderizado ---
 export function renderSimulationFrame() {
     const encoder = device.createCommandEncoder();
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(simPipeline);
-    computePass.setBindGroup(0, simBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 64));
-    computePass.end();
+    
+    if (useWasmSimulation && wasmSimulation) {
+        // Update WASM simulation parameters
+        const t = performance.now() / 1000;
+        const lfo = lfoA * Math.sin(2 * Math.PI * lfoS * t);
+        const ratioWithLFO = ratio + lfo;
+        
+        WASM.updateParams({
+            radius,
+            delta_t,
+            friction,
+            repulsion,
+            attraction,
+            k,
+            balance,
+            ratio: ratioWithLFO,
+            force_multiplier: forceMultiplier,
+            max_expected_neighbors: 400
+        });
+        
+        // Run WASM simulation step
+        WASM.simulateStep();
+        
+        // Get particle data from WASM and update GPU buffer
+        const particleData = WASM.getParticleData();
+        const particleFloats = new Float32Array(particleData);
+        device.queue.writeBuffer(particleBuffer, 0, particleFloats);
+    } else {
+        // Fallback to WebGPU compute simulation
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(simPipeline);
+        computePass.setBindGroup(0, simBindGroup);
+        computePass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 64));
+        computePass.end();
+    }
 
     const renderPass = encoder.beginRenderPass({
         colorAttachments: [
@@ -342,6 +404,11 @@ export function setForceOffset(value) {
 export function setCanvasDimensions(width, height) {
     canvasWidth = width;
     canvasHeight = height;
+    
+    // Update WASM simulation canvas size
+    if (useWasmSimulation && wasmSimulation) {
+        WASM.setCanvasSize(width, height);
+    }
 }
 
 export function getCurrentParams() {
